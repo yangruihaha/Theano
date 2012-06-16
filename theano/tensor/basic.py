@@ -5631,6 +5631,48 @@ class AdvancedSubtensor1(Op):
         x, ilist = ishapes
         return [ilist + x[1:]]
 
+    def c_code(self, node, name, input_names, output_names, sub):
+        x_name, i_name = input_names[0], input_names[1]
+        output_name = output_names[0]
+        fail = sub['fail']
+        if node.outputs[0].ndim != 2:
+            return super(SelectRowOp, self).c_code(node, name,
+                                                   input_names,
+                                                   output_names, sub)
+        return """
+        PyArrayObject *x = %(x_name)s;
+        PyArrayObject *i = %(i_name)s;
+
+        if(%(x_name)s->nd != 2){
+            PyErr_Format(PyExc_NotImplementedError,
+                         "AdvancedSubtensor1.c_code is only implemented"
+                         " for ndim==2.");
+             %(fail)s;
+        }
+{
+        Py_XDECREF(%(output_name)s);
+        npy_intp output_dims[2] = { i->dimensions[0], x->dimensions[1] };
+        PyArrayObject *out = (PyArrayObject*)PyArray_SimpleNewFromDescr (
+                                                  2, output_dims, x->descr);
+        if (!out) %(fail)s;
+        for (npy_intp ii = 0; ii < i->dimensions[0]; ++ii) {
+          int row = (int&)(i->data[ii * i->strides[0]]);
+          if (row >= x->dimensions[0] || row < 0){
+            PyErr_Format(PyExc_IndexError,
+                         "AdvancedSubtensor1.c_code index error: requested"
+                         " index %%d, but outer shape is %%d",
+                         row, x->dimensions[0]);
+             %(fail)s;
+          }
+          memcpy ((void*)&(out->data[ii * out->strides[0]]),
+                  (void*)&(x->data[row * x->strides[0]]),
+                  x->dimensions[1] * x->strides[1]);
+        }
+        Py_XINCREF (x->descr);
+        %(output_name)s = out;
+}
+        """ % locals()
+
 advanced_subtensor1 = AdvancedSubtensor1()
 
 
