@@ -365,6 +365,7 @@ def local_dimshuffle_lift(node):
 
     DimShuffle(Elemwise(x, y)) => Elemwise(DimShuffle(x), DimShuffle(y))
     DimShuffle(DimShuffle(x)) => DimShuffle(x)
+    DimShuffle{0, x}(broadcasted variable) => row
 
     After this transform, clusters of Elemwise operations are
     void of DimShuffle operations.
@@ -391,6 +392,22 @@ def local_dimshuffle_lift(node):
         else:
             return DimShuffle(iinput.type.broadcastable, new_order,
                               inplace).make_node(iinput).outputs
+    elif inode and (node.outputs[0].type == node.inputs[0].type and
+          len(node.inputs[0].type.broadcastable) == len(node.op.new_order)):
+        for idx, (broad, order) in enumerate(zip(node.inputs[0].type.broadcastable,
+                                                 node.op.new_order)):
+            if order == idx:
+                continue
+            elif broad == True and order == 'x':
+                continue
+            else:
+                return
+        assert len(node.outputs[0].type.broadcastable) == len(node.op.new_order)
+        return inode.outputs
+        print node
+        import pdb;pdb.set_trace()
+        pass
+
 
 
 @register_canonicalize
