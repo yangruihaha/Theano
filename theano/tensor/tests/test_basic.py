@@ -5725,14 +5725,24 @@ class test_sort(unittest.TestCase):
         cost = numpy.power(sort(a), 2).sum()
         g = theano.tensor.grad(cost, a)
         f = theano.function([a], g)
-        assert ((f([7, 10, 2]) == [20, 4, 14])[0])
+        data = numpy.asarray([7., 10., 2.])
+        assert ((f(data) == [20., 4., 14.])[0])
+        utt.verify_grad(sort, [data])
 
-    def test_grad_non_axis(self):
+    def test_grad_none_axis(self):
         a = theano.tensor.dvector()
         cost = numpy.power(sort(a, None), 2).sum()
         g = theano.tensor.grad(cost, a)
         f = theano.function([a], g)
-        assert ((f([7, 10, 2]) == [20, 4, 14])[0])
+        data = numpy.asarray([7., 10., 2.])
+        assert ((f(data) == [20., 4., 14.])[0])
+        utt.verify_grad(lambda x: sort(x, None), [data])
+        utt.verify_grad(lambda x: sort(x, 0), [data])
+
+        a = theano.tensor.dmatrix()
+        utt.verify_grad(lambda x: sort(x, None), [data])
+        utt.verify_grad(lambda x: sort(x, 0), [data])
+        utt.verify_grad(lambda x: sort(x, 1), [data])
 
 
 class TensorInferShapeTester(utt.InferShapeTester):
