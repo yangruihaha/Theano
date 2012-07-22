@@ -6291,7 +6291,7 @@ class ArgSortOp(theano.Op):
 
     def make_node(self, input, axis=-1):
         input = theano.tensor.as_tensor_variable(input)
-        if axis is None:
+        if axis is None or isinstance(axis, Constant) and axis.data is None:
             axis = Constant(gof.generic, None)
             bcast = [False]
         else:
@@ -6364,7 +6364,7 @@ class SortOp(theano.Op):
 
     def make_node(self, input, axis=-1):
         input = theano.tensor.as_tensor_variable(input)
-        if axis is None:
+        if axis is None or isinstance(axis, Constant) and axis.data is None:
             axis = Constant(gof.generic, None)
             # axis=None flattens the array before sorting
             out_type = tensor(dtype=input.dtype, broadcastable=[False])
@@ -6393,10 +6393,8 @@ class SortOp(theano.Op):
         return [inputs_shapes[0]]
 
     def grad(self, inputs, output_grads):
-        if isinstance(inputs[1], Constant):
-            inputDer = SortGradOp(self.kind, self.order)(inputs[0], output_grads, None)
-        else:
-            inputDer = SortGradOp(self.kind, self.order)(inputs[0], output_grads, inputs[1])
+        inputDer = SortGradOp(self.kind, self.order)(inputs[0], output_grads,
+                                                     inputs[1])
         return [inputDer, None]
     """
     def R_op(self, inputs, eval_points):
@@ -6411,9 +6409,10 @@ class SortOp(theano.Op):
 
 
 class SortGradOp(theano.Op):
-    """
-    This class is used to calculate the grad of the sort op because Theano does not support advanced indexing.
-    So it is created only to use numpy.argsort advanced indexing feature.
+    """This class is used to calculate the grad of the sort op because
+    Theano does not support advanced indexing.  So it is created only
+    to use numpy.argsort advanced indexing feature.
+
     """
     def __init__(self, kind, order=None):
         self.kind = kind
@@ -6433,7 +6432,7 @@ class SortGradOp(theano.Op):
     def make_node(self, input, g_out, axis=-1):
         input = theano.tensor.as_tensor_variable(input)
         g_out = theano.tensor.as_tensor_variable(g_out)
-        if axis is None:
+        if axis is None or isinstance(axis, Constant) and axis.data is None:
             axis = Constant(gof.generic, None)
             # axis=None flattens the array before sorting
             out_type = tensor(dtype=input.dtype, broadcastable=[False])
