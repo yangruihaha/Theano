@@ -1471,9 +1471,9 @@ def gcc_llvm():
             # Normally this should not happen as we should not try to
             # compile when g++ is not available. If this happen, it
             # will crash later so supposing it is not llvm is "safe".
-            output = ''
+            output = b('')
         del p
-        gcc_llvm.is_llvm = "llvm" in output
+        gcc_llvm.is_llvm = b("llvm") in output
     return gcc_llvm.is_llvm
 gcc_llvm.is_llvm = None
 
@@ -1529,16 +1529,19 @@ class GCC_compiler(object):
                 lines = []
                 if parse:
                     for line in stdout + stderr:
-                        if "COLLECT_GCC_OPTIONS=" in line:
+                        if b("COLLECT_GCC_OPTIONS=") in line:
                             continue
-                        elif "-march=" in line and "-march=native" not in line:
+                        elif b("-march=") in line and b("-march=native") not in line:
                             lines.append(line.strip())
-                        elif "-mtune=" in line and "-march=native" not in line:
+                        elif b("-mtune=") in line and b("-march=native") not in line:
                             lines.append(line.strip())
                     lines = list(set(lines))  # to remove duplicate
                 else:
                     lines = stdout + stderr
-                return lines
+                if PY3:
+                    return [line.decode() for line in lines]
+                else:
+                    return lines
 
             # The '-' at the end is needed. Otherwise, g++ do not output
             # enough information.
