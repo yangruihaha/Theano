@@ -37,13 +37,13 @@ from theano.tensor import (_shared, wvector, bvector, autocast_float_as,
         tensor_copy, tensordot, TensorType, Tri, tri, tril, triu, unbroadcast,
         var, Join, shape, MaxAndArgmax, lscalar, zvector, exp,
         get_scalar_constant_value, ivector, reshape, scalar_from_tensor, scal,
-        iscalars, arange,  dscalars, fvector, imatrix, numeric_grad,
+        iscalars, arange, dscalars, fvector, imatrix, numeric_grad,
         opt, ComplexError, lvector, lmatrix, true_div, max, min, Split, roll,
         tile, patternbroadcast, Eye, Shape, Dot, PermuteRowElements,
         ScalarFromTensor, TensorFromScalar, dtensor4, Rebroadcast, Alloc,
         dtensor3, SpecifyShape, Mean, IncSubtensor, AdvancedIncSubtensor1,
         itensor3, Tile, AdvancedIncSubtensor, switch, Diagonal, Diag,
-        nonzero, flatnonzero, nonzero_values)
+        nonzero, flatnonzero, nonzero_values, inplace_increment)
 from theano.tests import unittest_tools as utt
 
 
@@ -2998,6 +2998,20 @@ class T_subtensor(unittest.TestCase, utt.TestOptimizationMixin):
         self.assertTrue(tval.shape == ())
         self.assertTrue(numpy.all(tval == 0))
 
+    def test_long(self):
+        n = self.shared(numpy.arange(12, dtype=self.dtype).reshape((4, 3)))
+        t = n[1L:4L:2L, 1L]
+        self.assertTrue(isinstance(t.owner.op, Subtensor))
+        tval = self.eval_output_and_check(t)
+        self.assertTrue(tval.shape == (2,))
+        self.assertTrue(numpy.all(tval == [4, 10]))
+
+    def test_long_too_big(self):
+        # Currently, we cast Python longs to int64 when used for indexing.
+        # This test checks that using a long that does not fit raises an error.
+        n = self.shared(numpy.arange(12, dtype=self.dtype).reshape((4, 3)))
+        self.assertRaises(Exception, lambda: n[:(2L ** 63)])
+
     def test_newaxis(self):
         """
         newaxis support comes from logic in the __getitem__ of TensorType
@@ -3131,10 +3145,6 @@ class T_subtensor(unittest.TestCase, utt.TestOptimizationMixin):
         n = self.shared(numpy.asarray(5, dtype=self.dtype))
         self.assertRaises(TypeError, n.__getitem__, [0, 0])
 
-    def test_err_invalid_not_2d(self):
-        n = self.shared(numpy.ones((3, 3, 3), dtype=self.dtype) * 5)
-        self.assertRaises(NotImplementedError, n.__getitem__,
-                          ([0, 0, 0], [1, 1, 1], [2, 2, 2]))
 
     def test_err_invalid_2list_dtype(self):
         n = self.shared(numpy.ones((3, 3), dtype=self.dtype) * 5)
@@ -3407,9 +3417,9 @@ class T_subtensor(unittest.TestCase, utt.TestOptimizationMixin):
             utt.verify_grad(fct, [data])
 
             # Test the grad of the grad (e.i. AdvancedIncSubtensor1.grad)
-            def fct(t):
+            def fct2(t):
                 return grad(sum(t[idx_]), t)
-            utt.verify_grad(fct, [data])
+            utt.verify_grad(fct2, [data])
 
             # Test shape of AdvancedIncSubtensor1 and AdvancedSubtensor1
             if not self.fast_compile:
@@ -3725,6 +3735,109 @@ class TestIncSubtensor1(unittest.TestCase):
         self.assertRaises(TypeError,
                 lambda: inc_subtensor(self.v[self.adv1q], fmatrix()))
 
+inplace_increment_missing = SkipTest("inc_subtensor with advanced indexing not enabled. "
+                       "Installing NumPy 1.8 or the latest development version "
+                       "should make that feature available.")
+
+class TestAdvancedSubtensor(unittest.TestCase):
+    # test inc_subtensor
+    # also tests set_subtensor
+
+    def setUp(self):
+        self.s = iscalar()
+        self.v = fvector()
+        self.m = dmatrix()
+        self.t = ctensor3()
+
+        self.ix1 = lvector()  # advanced 1d query
+        self.ix12 = lvector()
+        self.ix2 = lmatrix()
+
+    def test_cant_adv_idx_into_scalar(self):
+        self.assertRaises(TypeError, lambda: self.s[self.ix1])
+
+    def test_index_into_vec_w_vec(self):
+        a = self.v[self.ix1]
+        assert a.type == self.v.type, (a.type, self.v.type)
+
+    def test_index_into_vec_w_matrix(self):
+        a = self.v[self.ix2]
+        assert a.dtype == self.v.dtype, (a.dtype, self.v.dtype)
+        assert a.broadcastable == self.ix2.broadcastable, (
+                a.broadcastable, self.ix2.broadcastable)
+
+    def test_inc_adv_subtensor_w_matrix(self):
+        if inplace_increment is None: 
+            raise inplace_increment_missing
+        
+        subt = self.v[self.ix2]
+        a = inc_subtensor(subt,subt)
+
+        assert a.type == self.v.type, (a.type, self.v.type)
+        f = theano.function([self.v, self.ix2], a, allow_input_downcast=True)
+        aval = f([.4, .9, .1], [[1, 2],
+                                [1, 2]])
+        assert numpy.allclose(aval, [.4, .9 * 3, .1 * 3])
+
+    def test_inc_adv_subtensor_w_2vec(self):
+        if inplace_increment is None: 
+            raise inplace_increment_missing
+
+        subt = self.m[self.ix1, self.ix12]
+        a = inc_subtensor(subt, subt)
+
+        typ = TensorType(self.m.type.dtype, self.ix2.type.broadcastable)
+        assert a.type == typ, (a.type, typ)
+        f = theano.function([self.m, self.ix1, self.ix12], a,
+                            allow_input_downcast=True)
+        aval = f([[.4, .9, .1],
+                  [5,   6,  7],
+                  [.5, .3, .15]],
+                 [1, 2, 1],
+                 [0, 1, 0])
+        assert numpy.allclose(aval,
+                [[.4, .9, .1],
+                  [5 * 3,   6,  7],
+                  [.5, .3 * 2, .15]]), aval
+
+    def test_inc_adv_subtensor_with_broadcasting(self):
+        if inplace_increment is None: 
+            raise inplace_increment_missing
+
+        a = inc_subtensor(self.m[self.ix1, self.ix12], 2.1)
+
+        assert a.type == self.m.type, (a.type, self.m.type)
+        f = theano.function([self.m, self.ix1, self.ix12], a,
+                            allow_input_downcast=True)
+        aval = f([[.4, .9, .1],
+                  [5,   6,  7],
+                  [.5, .3, .15]],
+                 [1, 2, 1],
+                 [0, 1, 0])
+        assert numpy.allclose(aval,
+                [[.4, .9, .1],
+                  [5 + 2.1 * 2,   6,  7],
+                  [.5, .3 + 2.1, .15]]), aval
+
+    def test_inc_adv_subtensor_with_index_broadcasting(self):
+        if inplace_increment is None: 
+            raise inplace_increment_missing
+
+        a = inc_subtensor(self.m[self.ix1, self.ix2], 2.1)
+
+        assert a.type == self.m.type, (a.type, self.m.type)
+        f = theano.function([self.m, self.ix1, self.ix2], a,
+                            allow_input_downcast=True)
+        aval = f([[.4, .9, .1],
+                  [5,   6,  7],
+                  [.5, .3, .15]],
+                 [0, 2, 0],
+                 [[0, 1, 0],
+                  [2, 2, 2]])
+        assert numpy.allclose(aval,
+                [[.4 + 2*2.1, .9, .1 + 2*2.1],
+                  [5 ,   6,  7 ],
+                  [.5, .3 + 2.1, .15 + 2.1]]), aval
 
 class T_Join_and_Split(unittest.TestCase):
     """
@@ -5037,6 +5150,13 @@ class T_reshape(unittest.TestCase):
 
         assert numpy.all(f_sub(a_val, b_val) == [2, 3])
 
+    def test_reshape_long_in_shape(self):
+        v = dvector('v')
+        r = v.reshape((v.shape[0], 1L))
+        print r.eval({v: numpy.arange(5.)})
+        assert numpy.allclose(r.eval({v: numpy.arange(5.)}).T,
+                              numpy.arange(5.))
+
     def test_bad_shape(self):
         a = matrix('a')
         shapes = ivector('shapes')
@@ -5590,7 +5710,7 @@ class TestPermuteRowElements(unittest.TestCase):
         out_val = permute(input_val, p_val)
 
         # The same permutation should be applied to every row of the input matrix.
-        out_bis = numpy.asarray([row[p_val] for row in input_val])
+        out_bis = numpy.asarray([r[p_val] for r in input_val])
         assert numpy.all(out_val == out_bis)
 
         # Verify gradient
@@ -6056,7 +6176,7 @@ def _test_autocast_numpy():
     def ok(z):
         assert tensor.constant(z).dtype == numpy.asarray(z).dtype
     for x in ([2 ** i for i in xrange(63)] +
-              [0] +
+              [0, 0L, 1L, 2L ** 63 - 1] +
               [0., 1., 1.1, 1.5]):
         n_x = numpy.asarray(x)
         # Make sure the data type is the same as the one found by numpy.
@@ -6085,11 +6205,11 @@ def _test_autocast_numpy_floatX():
         for floatX in ('float32', 'float64'):
             config.floatX = floatX
             # Go through some typical scalar values.
-            # Note that we only consider integer values that Python considers
-            # to be 'int', because 'long' is not supported by Theano (due to
-            # the fact it is unbounded).
-            for x in ([2 ** i for i in xrange(64) if type(2 ** i) == int] +
-                      [0] +
+            # We only consider 'int' and 'long' Python values that can fit
+            # into int64, as that is the maximal integer type that Theano
+            # supports, and that is the maximal type in Python indexing.
+            for x in ([2 ** i - 1 for i in xrange(64)] +
+                      [0, 0L, 1L, 2L ** 63 - 1] +
                       [0., 1., 1.1, 1.5]):
                 ok(x, floatX)
                 ok(-x, floatX)
@@ -6251,6 +6371,29 @@ class test_arithmetic_cast(unittest.TestCase):
                         'default',
                         message='Division of two integer',
                         category=DeprecationWarning)
+
+
+class T_long_tensor(unittest.TestCase):
+    def test_fit_int64(self):
+        for exp in xrange(64):
+            val = 2L ** exp - 1
+            scalar_ct = constant(val)
+            assert scalar_ct.dtype == 'int64'
+            assert scalar_ct.value == val
+
+            vector_ct = constant([val, val])
+            assert vector_ct.dtype == 'int64'
+            assert numpy.all(vector_ct.value == val)
+
+            matrix_ct = constant([[val, val]])
+            assert matrix_ct.dtype == 'int64'
+            assert numpy.all(matrix_ct.value == val)
+
+    def test_too_big(self):
+        val = 2L ** 63
+        self.assertRaises(Exception, constant, val)
+        self.assertRaises(Exception, constant, [val, val])
+        self.assertRaises(Exception, constant, [[val, val]])
 
 
 class test_broadcast(unittest.TestCase):
@@ -6488,6 +6631,18 @@ class T_get_scalar_constant_value(unittest.TestCase):
         for i in range(c.value.shape[0]):
             for j in range(c.value.shape[1]):
                 assert get_scalar_constant_value(c[i, j]) == c.value[i, j]
+
+    def test_numpy_array(self):
+        # Regression test for crash when called on a numpy array.
+        assert get_scalar_constant_value(numpy.array(3)) == 3
+        self.assertRaises(
+                tensor.NotScalarConstantError,
+                get_scalar_constant_value,
+                numpy.array([0, 1]))
+        self.assertRaises(
+                tensor.EmptyConstantError,
+                get_scalar_constant_value,
+                numpy.array([]))
 
 
 class T_as_tensor_variable(unittest.TestCase):

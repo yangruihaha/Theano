@@ -8,7 +8,7 @@ from itertools import izip
 from textwrap import dedent
 
 import numpy
-#from copy import copy as python_copy
+from copy import copy as python_copy
 
 import theano
 from theano.compat import PY3
@@ -23,6 +23,12 @@ from theano.gof.utils import MethodNotDefined
 from theano import compile, printing
 from theano.printing import pprint, min_informative_str
 from theano.tensor.utils import hash_from_ndarray
+
+import theano.gof.cutils  # needed to import cutils_ext
+try:
+    from cutils_ext.cutils_ext import inplace_increment
+except ImportError:
+    inplace_increment = None
 
 # We use these exceptions as well.
 from theano.scalar import ComplexError, IntegerDivisionError
@@ -43,14 +49,14 @@ python_any = any
 python_all = all
 
 # Define common subsets of dtypes (as strings).
-int_dtypes = map(str, scal.int_types)
-uint_dtypes = map(str, scal.uint_types)
-float_dtypes = map(str, scal.float_types)
 complex_dtypes = map(str, scal.complex_types)
-
 continuous_dtypes = map(str, scal.continuous_types)
+float_dtypes = map(str, scal.float_types)
 discrete_dtypes = map(str, scal.discrete_types)
 all_dtypes = map(str, scal.all_types)
+int_dtypes = map(str, scal.int_types)
+uint_dtypes = map(str, scal.uint_types)
+
 
 # Do a lazy import of the sparse module
 sparse_module_ref = None
@@ -504,7 +510,7 @@ def get_scalar_constant_value(v):
     if isinstance(v, (numpy.integer, int, float)):
         return numpy.asarray(v)
 
-    def numpy_scalar(n):
+    def numpy_scalar(data):
         """ Return a scalar stored in a numpy ndarray, or raise
         NotScalarConstantError if the numpy ndarray is not a scalar
         """
@@ -520,7 +526,7 @@ def get_scalar_constant_value(v):
         except Exception:
             raise NotScalarConstantError(
                 'v.data is non-numeric, non-scalar, or has more than one'
-                ' unique value', n)
+                ' unique value', data)
 
     if isinstance(v, numpy.ndarray):
         return numpy_scalar(v)
@@ -4244,27 +4250,114 @@ def get_canonical_form_slice(theslice, length):
     that respects the conventions imposed by python and numpy.
 
     In a canonical form a slice is represented by a canonical form slice,
-    in which the start <= stop and step >0 and a flag which says if the
-    resulting set of numbers needs to be reversed or not.
-   '''
+    in which 0 <= start <= stop <= length and step > 0, and a flag which says
+    if the resulting set of numbers needs to be reversed or not.
+    '''
 
     if isinstance(theslice, slice):
 
-        start = extract_constant(theslice.start)
-        stop = extract_constant(theslice.stop)
-        step = extract_constant(theslice.step)
+        def analyze(x):
+            try:
+                x_constant = get_scalar_constant_value(x)
+                is_constant = True
+            except NotScalarConstantError:
+                x_constant = extract_constant(x)
+                is_constant = False
+            return x_constant, is_constant
+
+        start, is_start_constant = analyze(theslice.start)
+        stop, is_stop_constant = analyze(theslice.stop)
+        step, is_step_constant = analyze(theslice.step)
+        length, is_length_constant = analyze(length)
+
         if step is None:
             step = 1
 
-        defstart = switch(lt(step, 0), (length - 1), 0)
-        defstop = switch(lt(step, 0), -1, length)
+        # First handle the easier and common case where `step` is 1 and
+        # either `start` or `stop` is a range boundary. More specializations
+        # could be added later. This makes the resulting graph smaller than
+        # in the generic case below.
+        if step == 1:
+            is_start_0 = (
+                    start in [None, 0] or
+                    (is_start_constant and is_length_constant and
+                     start < 0 and start + length <= 0))
+            is_stop_length = (
+                    stop in [None, length, maxsize] or
+                    (is_stop_constant and is_length_constant and
+                     stop >= length))
+            if is_start_0:
+                # 0:stop:1
+                if is_stop_length:
+                    # Full slice.
+                    return slice(0, length, 1), 1
+                if is_stop_constant and stop >= 0:
+                    return (slice(0, switch(lt(stop, length), stop, length),
+                                  1), 1)
+                stop_plus_len = stop + length
+                stop = switch(
+                        lt(stop, 0),
+                        # stop < 0
+                        switch(
+                            lt(stop_plus_len, 0),
+                            # stop + len < 0
+                            0,
+                            # stop + len >= 0
+                            stop_plus_len),
+                        # stop >= 0: use min(stop, length)
+                        switch(lt(stop, length), stop, length))
+                return slice(0, stop, 1), 1
+            elif is_stop_length:
+                # start:length:1
+                if is_start_constant and start >= 0:
+                    return slice(switch(lt(start, length), start, length),
+                                 length, 1), 1
+                start_plus_len = start + length
+                start = switch(
+                        lt(start, 0),
+                        # start < 0
+                        switch(
+                            lt(start_plus_len, 0),
+                            # start + len < 0
+                            0,
+                            # start + len >= 0
+                            start_plus_len),
+                        # start >= 0: use min(start, length)
+                        switch(lt(start, length), start, length))
+                return slice(start, length, 1), 1
+
+        # This is the generic case.
+
+        if is_step_constant:
+            # When we know the sign of `step`, the graph can be made simpler.
+            assert step != 0
+            if step > 0:
+                def switch_neg_step(a, b):
+                    return b
+                abs_step = step
+                sgn_step = 1
+            else:
+                def switch_neg_step(a, b):
+                    return a
+                abs_step = -step
+                sgn_step = -1
+        else:
+            is_step_neg = lt(step, 0)
+
+            def switch_neg_step(a, b):
+                return switch(is_step_neg, a, b)
+            abs_step = abs(step)
+            sgn_step = sgn(step)
+
+        defstart = switch_neg_step(length - 1, 0)
+        defstop = switch_neg_step(-1, length)
         if start is None:
             start = defstart
         else:
             start = switch(lt(start, 0), start + length, start)
-            start = switch(lt(start, 0), switch(lt(step, 0), -1, 0), start)
+            start = switch(lt(start, 0), switch_neg_step(-1, 0), start)
             start = switch(ge(start, length),
-                           switch(lt(step, 0), (length - 1), length),
+                           switch_neg_step(length - 1, length),
                            start)
         if stop in [None, maxsize]:
             # The special "maxsize" case is probably not needed here,
@@ -4276,18 +4369,20 @@ def get_canonical_form_slice(theslice, length):
             stop = switch(lt(stop, 0), -1, stop)
             stop = switch(ge(stop, length), length, stop)
 
-        nw_stop = switch(lt(step, 0), (start + 1), stop)
-        slice_len = (start - stop - 1) // abs(step) + 1
+        nw_stop = switch_neg_step(start + 1, stop)
+        slice_len = (start - stop - 1) // abs_step + 1
         slice_len = switch(lt(slice_len, 0), 0, slice_len)
-        neg_start = nw_stop - (slice_len - 1) * abs(step) - 1
+        neg_start = nw_stop - (slice_len - 1) * abs_step - 1
         neg_start = switch(lt(neg_start, 0), (nw_stop - 1), neg_start)
-        nw_start = switch(lt(step, 0), neg_start, start)
+        nw_start = switch_neg_step(neg_start, start)
         nw_start = switch(lt(nw_start, 0), 0, nw_start)
         nw_stop = switch(lt(nw_stop, 0), 0, nw_stop)
+        # Ensure start <= stop.
+        nw_start = switch(lt(nw_start, nw_stop), nw_start, nw_stop)
 
-        nw_step = abs(step)
+        nw_step = abs_step
         if step != 1:
-            reverse = sgn(step)
+            reverse = sgn_step
             return slice(nw_start, nw_stop, nw_step), reverse
         else:
             return slice(nw_start, nw_stop, nw_step), 1
@@ -4446,10 +4541,17 @@ class Subtensor(Op):
                 slice_c = None
 
             return slice(slice_a, slice_b, slice_c)
-        # There is a bug in numpy that results in isinstance(x, int) returning False for numpy integers.
+        # There is a bug in numpy that results in isinstance(x, int) returning
+        # False for numpy integers.
         # See <http://projects.scipy.org/numpy/ticket/2235>.
         elif isinstance(entry, (numpy.integer, int)):
             return entry
+        # On Windows 64-bit, shapes are returned as Python long, as they can
+        # be bigger than what a Python int can hold.
+        # Shapes should always fit in a numpy.int64, and we support them better
+        elif isinstance(entry, long):
+            entry64 = numpy.int64(entry)
+            return entry64
         else:
             raise AdvancedIndexingError(Subtensor.e_indextype, entry)
 
@@ -4541,10 +4643,11 @@ class Subtensor(Op):
                     and (idx.step is None or idx.step == 1)):
                     outshp.append(xl)
                 else:
-                    cnf = get_canonical_form_slice(idx, xl)
-                    length = ((cnf[0].stop - cnf[0].start - 1) // cnf[0].step
-                            + 1)
-                    length = switch(lt(length, 0), 0, length)
+                    cnf = get_canonical_form_slice(idx, xl)[0]
+                    if cnf.step == 1:
+                        length = cnf.stop - cnf.start
+                    else:
+                        length = (cnf.stop - cnf.start - 1) // cnf.step + 1
                     outshp.append(length)
                 i += 1
             else:
@@ -5077,6 +5180,7 @@ def inc_subtensor(x, y, inplace=False, set_instead_of_inc=False,
     """
     # First of all, y cannot have a higher dimension than x,
     # nor have non-broadcastable dimensions where x is broadcastable.
+
     x = as_tensor_variable(x)
     y = as_tensor_variable(y)
 
@@ -5117,11 +5221,11 @@ def inc_subtensor(x, y, inplace=False, set_instead_of_inc=False,
         return the_op(real_x, y, ilist)
     elif isinstance(x.owner.op, AdvancedSubtensor):
         real_x = x.owner.inputs[0]
-        coordvec_0 = x.owner.inputs[1]
-        coordvec_1 = x.owner.inputs[2]
+        ilist = x.owner.inputs[1:]
+
         the_op = AdvancedIncSubtensor(inplace,
                                       set_instead_of_inc=set_instead_of_inc)
-        return the_op(real_x, y, coordvec_0, coordvec_1)
+        return the_op(real_x, y, *ilist)
     elif isinstance(x.owner.op, DimShuffle):
         inner_x = x.owner.inputs[0]
         # In the dimshuffle case, there are in fact two dimshuffles:
@@ -5147,7 +5251,7 @@ def inc_subtensor(x, y, inplace=False, set_instead_of_inc=False,
         # Try to apply inc_subtensor on inner_x.
         # If it works, there is no need to reshape, as the inc_subtensor
         # will have the same shape as inner_x, which is what we want.
-        inner_incsubtensor = inc_subtensor(inner_x, y,
+        inner_incsubtensor = inc_subtensor(inner_x, y.flatten(),
                 inplace=inplace,
                 set_instead_of_inc=set_instead_of_inc,
                 tolerate_inplace_aliasing=tolerate_inplace_aliasing)
@@ -6110,7 +6214,8 @@ def stack(*tensors):
     # See ticket #660
     if numpy.all([
                   # in case there is direct int in tensors.
-                  isinstance(t, (numpy.number, float, int, python_complex)) or
+                  isinstance(t, (numpy.number, float, int, python_complex,
+                                 long)) or
                   (isinstance(t, Variable) and
                    isinstance(t.type, TensorType) and
                    t.ndim == 0)
@@ -7016,7 +7121,8 @@ class AdvancedSubtensor1(Op):
                 // if all values fit.
                 if (!PyArray_CanCastSafely(i_type, NPY_INTP)) {
                     npy_int64 min_val, max_val;
-                    PyObject* py_min_val = PyArray_Min(%(i_name)s, NPY_MAXDIMS, NULL);
+                    PyObject* py_min_val = PyArray_Min(%(i_name)s, NPY_MAXDIMS,
+                                                       NULL);
                     if (py_min_val == NULL) {
                         %(fail)s;
                     }
@@ -7025,7 +7131,8 @@ class AdvancedSubtensor1(Op):
                     if (min_val == -1 && PyErr_Occurred()) {
                         %(fail)s;
                     }
-                    PyObject* py_max_val = PyArray_Max(%(i_name)s, NPY_MAXDIMS, NULL);
+                    PyObject* py_max_val = PyArray_Max(%(i_name)s, NPY_MAXDIMS,
+                                                       NULL);
                     if (py_max_val == NULL) {
                         %(fail)s;
                     }
@@ -7035,7 +7142,8 @@ class AdvancedSubtensor1(Op):
                         %(fail)s;
                     }
                     if (min_val < NPY_MIN_INTP || max_val > NPY_MAX_INTP) {
-                        PyErr_SetString(PyExc_IndexError, "Index contains values "
+                        PyErr_SetString(PyExc_IndexError,
+                                     "Index contains values "
                                      "that are bigger than the maximum array "
                                      "size on this system.");
                         %(fail)s;
@@ -7066,7 +7174,8 @@ class AdvancedSubtensor1(Op):
                     }
                     if (%(output_name)s != NULL) {
                         for (; i < nd; i++) {
-                            if (shape[i] != PyArray_DIMS(%(a_name)s)[i-PyArray_NDIM(indices)+1]) {
+                            if (shape[i] != PyArray_DIMS(%(a_name)s)[
+                                                i-PyArray_NDIM(indices)+1]) {
                                 Py_CLEAR(%(output_name)s);
                                 break;
                             }
@@ -7074,8 +7183,8 @@ class AdvancedSubtensor1(Op):
                     }
                 }
             }
-            %(output_name)s = (PyArrayObject*)PyArray_TakeFrom(%(a_name)s, indices, 0,
-                                                               %(output_name)s, NPY_RAISE);
+            %(output_name)s = (PyArrayObject*)PyArray_TakeFrom(
+                        %(a_name)s, indices, 0, %(output_name)s, NPY_RAISE);
             Py_DECREF(indices);
             if (%(output_name)s == NULL) %(fail)s;
         """ % locals()
@@ -7084,6 +7193,7 @@ class AdvancedSubtensor1(Op):
         return (0, 1, 1)
 
 advanced_subtensor1 = AdvancedSubtensor1()
+
 
 class AdvancedIncSubtensor1(Op):
     """Increments a subtensor using advanced slicing (list of index)"""
@@ -7147,18 +7257,26 @@ class AdvancedIncSubtensor1(Op):
         if self.set_instead_of_inc:
             x[idx] = y
         else:
-            # If `y` has as many dimensions as `x`, then we want to iterate
-            # jointly on `x` and `y`. Otherwise, it means `y` should be
-            # broadcasted to fill all relevant rows of `x`.
-            assert y.ndim <= x.ndim   # Should be guaranteed by `make_node`
-            if y.ndim == x.ndim:
-                assert len(y) == len(idx)
-                for (j, i) in enumerate(idx):
-                    x[i] += y[j]
-            else:
-                for i in idx:
-                    x[i] += y
+            increment = inplace_increment
+            if increment is None:
+                increment = self.inplace_increment1d_slow
+
+            increment(x, idx, y)
+
         out[0] = x
+
+    def inplace_increment1d_slow(self, x, idx, y):
+        # If `y` has as many dimensions as `x`, then we want to iterate
+        # jointly on `x` and `y`. Otherwise, it means `y` should be
+        # broadcasted to fill all relevant rows of `x`.
+        assert y.ndim <= x.ndim   # Should be guaranteed by `make_node`
+        if y.ndim == x.ndim:
+            assert len(y) == len(idx)
+            for (j, i) in enumerate(idx):
+                x[i] += y[j]
+        else:
+            for i in idx:
+                x[i] += y
 
     def infer_shape(self, node, ishapes):
         x, y, ilist = ishapes
@@ -7188,6 +7306,113 @@ class AdvancedIncSubtensor1(Op):
 advanced_inc_subtensor1 = AdvancedIncSubtensor1()
 
 
+def as_index_variable(idx):
+    if idx is None:
+        return NoneConst
+    if isinstance(idx, slice):
+        return make_slice(idx)
+    idx = as_tensor_variable(idx)
+    if idx.type.dtype[:3] not in ('int', 'uin'):
+        raise TypeError('index must be integers')
+    return idx
+
+
+def as_int_none_variable(x):
+    if x is None:
+        return NoneConst
+    x = as_tensor_variable(x, ndim=0)
+    if x.type.dtype[:3] not in ('int', 'uin'):
+        raise TypeError('index must be integers')
+    return x
+
+
+class MakeSlice(Op):
+    def make_node(self, slc):
+        return Apply(self,
+                     map(as_int_none_variable,
+                         [slc.start, slc.stop, slc.step]),
+                     [slicetype()])
+
+    def perform(self, node, inp, out_):
+        out, = out_
+        out[0] = slice(*inp)
+
+    def __str__(self):
+        return self.__class__.__name__
+
+    def __eq__(self, other):
+        return type(self) == type(other)
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def grad(self, inputs, grads):
+        return [DisconnectedType()() for i in inputs]
+
+make_slice = MakeSlice()
+
+
+class SliceType(gof.Type):
+
+    def filter(self, x, strict=False, allow_downcast=None):
+        if isinstance(x, slice):
+            return x
+        else:
+            raise TypeError('Expected a slice!')
+
+    def __str__(self):
+        return "slice"
+
+slicetype = SliceType()
+
+
+class NoneTypeT(gof.Type):
+
+    def filter(self, x, strict=False, allow_downcast=None):
+        if x is None:
+            return x
+        else:
+            raise TypeError('Expected None!')
+
+    def __str__(self):
+        return "None"
+
+NoneConst = Constant(NoneTypeT(), None, name='None')
+
+
+def adv_index_broadcastable_pattern(a, idx):
+    """
+    This function is only used to determine the broadcast pattern for
+    AdvancedSubtensor output variable.
+
+    For this, we make a fake ndarray and a fake idx and call use ask numpy
+    the output. From this, we find the output broadcast pattern.
+    """
+
+    def replace_slice(v):
+        if isinstance(v, gof.Apply):
+            if len(v.outputs) != 1:
+                raise ValueError(
+                    "It is ambiguous which output of a multi-output Op has"
+                    " to be fetched.", v)
+            else:
+                v = v.outputs[0]
+
+        if NoneConst.equals(v):
+            return None
+        if isinstance(v.type, SliceType):
+            return slice(None, None)
+
+        return numpy.zeros((2,) * v.ndim, int)
+
+    newidx = tuple(map(replace_slice, idx))
+
+    #2 - True = 1; 2 - False = 2
+    fakeshape = [2 - bc for bc in a.broadcastable]
+    retshape = numpy.empty(fakeshape)[newidx].shape
+    return tuple([dim == 1 for dim in retshape])
+
+
 class AdvancedSubtensor(Op):
     """Return a subtensor copy, using advanced indexing.
     """
@@ -7204,37 +7429,15 @@ class AdvancedSubtensor(Op):
     def __str__(self):
         return self.__class__.__name__
 
-    def make_node(self, x, *inputs):
+    def make_node(self, x, *index):
         x = as_tensor_variable(x)
-        # FIXME
-        # Note (9 Jul 2012): what does this 'FIXME' mean? Possibly that the
-        # current implementation must be generalized? Please specify.
-        if x.ndim == 2 and len(inputs) == 2:
-            ind1 = as_tensor_variable(inputs[0])
-            ind2 = as_tensor_variable(inputs[1])
-            if (not (ind1.type.dtype.startswith('int') or
-                     ind1.type.dtype.startswith('uint'))):
-                raise TypeError(
-                    'the indices into a matrix must be int or uint. It is ',
-                    ind1.type.dtype)
-            if (not (ind2.type.dtype.startswith('int') or
-                     ind2.type.dtype.startswith('uint'))):
-                raise TypeError(
-                    'the indices into a matrix must be int or uint. It is ',
-                    ind2.type.dtype)
 
-            if ind1.ndim == 1 and ind2.ndim == 1:
-                return gof.Apply(self,
-                        (x, ind1, ind2),
-                        [tensor(dtype=x.type.dtype,
-                            broadcastable=[False])])
-            raise NotImplementedError(
-                'Advanced indexing of x (of dimension %i) with these argument'
-                ' dimensions (%s) not supported yet'
-                    % (x.ndim, ','.join(str(input.ndim) for input in inputs)))
-        raise NotImplementedError(
-            'Advanced indexing of x with arguments (%s) not supported yet'
-                % ','.join(str(input) for input in inputs))
+        index = tuple(map(as_index_variable, index))
+        bcast = adv_index_broadcastable_pattern(x, index)
+        return gof.Apply(self,
+                         (x,) + index,
+                         [tensor(dtype=x.type.dtype,
+                                 broadcastable=bcast)])
 
     def R_op(self, inputs, eval_points):
         if eval_points[0] is None:
@@ -7309,6 +7512,8 @@ class AdvancedIncSubtensor(Op):
             raise NotImplementedError('In place computation is not'
                                       ' implemented')
 
+        self.allow_legacy_perform = False
+
     def __hash__(self):
         return hash((type(self), self.inplace, self.set_instead_of_inc))
 
@@ -7326,24 +7531,43 @@ class AdvancedIncSubtensor(Op):
         x = as_tensor_variable(x)
         y = as_tensor_variable(y)
 
-        if x.ndim == 2 and y.ndim == 1 and len(inputs) == 2:
-            ind1 = as_tensor_variable(inputs[0])
-            ind2 = as_tensor_variable(inputs[1])
-            if ind1.ndim == 1 and ind2.ndim == 1:
-                return gof.Apply(self,
+        op = self
+        # If we are incrementing, but the increment compiled function is not
+        # available, we need to support legacy cases.
+        if not self.set_instead_of_inc and inplace_increment is None:
+            legacy_conditions = False
+            if x.ndim == 2 and y.ndim == 1 and len(inputs) == 2:
+                ind1 = as_tensor_variable(inputs[0])
+                ind2 = as_tensor_variable(inputs[1])
+                if ind1.ndim == 1 and ind2.ndim == 1:
+                    if ind1.owner and isinstance(ind1.owner.op, ARange):
+                        legacy_conditions = True
+                    elif isinstance(ind1, Constant):
+                        # Make sure no index is duplicated
+                        val = ind1.value
+                        if numpy.unique(val).size == val.size:
+                            legacy_conditions = True
+                    elif ind2.owner and isinstance(ind2.owner.op, ARange):
+                        legacy_conditions = True
+                    elif isinstance(ind2, Constant):
+                        # Make sure no index is duplicated
+                        val = ind2.value
+                        if numpy.unique(val).size == val.size:
+                            legacy_conditions = True
+            if legacy_conditions:
+                op = python_copy(self)
+                op.allow_legacy_perform = True
+            else:
+                raise NotImplementedError(
+                        'Could not import inplace_increment, so some advanced '
+                        'indexing features are disabled. They will be '
+                        'available if you update NumPy to version 1.8 or '
+                        'later, or to the latest development version.')
+
+        return gof.Apply(op,
                         (x, y) + inputs,
                         [tensor(dtype=x.type.dtype,
                             broadcastable=x.type.broadcastable)])
-            raise NotImplementedError(
-                'Advanced indexing increment/set of x (of dimension %i) by y'
-                ' (of dimension %i) with these argument dimensions (%s) not'
-                ' supported yet'
-                % (x.ndim, y.ndim,
-                   ','.join(str(input.ndim) for input in inputs)))
-        raise NotImplementedError(
-            'Advanced indexing increment/set of x (of dim %i) by y (of dim %i)'
-            ' with arguments (%s) not supported yet'
-            % (x.ndim, y.ndim, ','.join(str(input) for input in inputs)))
 
     def perform(self, node, inputs, out_):
         # TODO: 1. opt to make this in place 2. generalize as described in
@@ -7353,12 +7577,20 @@ class AdvancedIncSubtensor(Op):
         if not self.inplace:
             out[0] = inputs[0].copy()
         else:
-            raise NotImplementedError('In place computation is not'
-                                      ' implemented')
+            out[0] = inputs[0]
+
         if self.set_instead_of_inc:
             out[0][inputs[2:]] = inputs[1]
-        else:
+        elif inplace_increment is not None:
+            inplace_increment(out[0], tuple(inputs[2:]), inputs[1])
+        elif self.allow_legacy_perform:
             out[0][inputs[2:]] += inputs[1]
+        else:
+            raise NotImplementedError(
+                    'Could not import inplace_increment, so some advanced '
+                    'indexing features are disabled. They will be '
+                    'available if you update NumPy to version 1.8 or '
+                    'later, or to the latest development version.')
 
         if (numpy.__version__ <= '1.6.1' and
                 out[0].size != numpy.uint32(out[0].size)):

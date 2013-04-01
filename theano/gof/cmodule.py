@@ -5,6 +5,7 @@ import cPickle
 import logging
 import operator
 import os
+import re
 import shutil
 import stat
 import StringIO
@@ -121,8 +122,18 @@ class ExtFunction(object):
 
 
 class DynamicModule(object):
-    def __init__(self, name):
-        self.name = name
+    def __init__(self, name=None):
+        assert name is None, ("The 'name' parameter of DynamicModule"
+                " cannot be specified anymore. Instead, 'code_hash'"
+                " will be automatically computed and can be used as"
+                " the module's name.")
+        # While the module is not finalized, we can call add_...
+        # when it is finalized, a hash is computed and used instead of
+        # the placeholder, and as module name.
+        self.finalized = False
+        self.code_hash = None
+        self.hash_placeholder = '<<<<HASH_PLACEHOLDER>>>>'
+
         self.support_code = []
         self.functions = []
         self.includes = ["<Python.h>", "<iostream>"]
@@ -150,31 +161,35 @@ static struct PyModuleDef moduledef = {{
       -1,
       MyMethods,
 }};
-""".format(name=self.name)
-            print >> stream, "PyMODINIT_FUNC PyInit_%s(void) {" % self.name
+""".format(name=self.hash_placeholder)
+            print >> stream, "PyMODINIT_FUNC PyInit_%s(void) {" % self.hash_placeholder
             for block in self.init_blocks:
                 print >> stream, '  ', block
             print >> stream, "    PyObject *m = PyModule_Create(&moduledef);"
             print >> stream, "    return m;"
         else:
-            print >> stream, "PyMODINIT_FUNC init%s(void){" % self.name
+            print >> stream, "PyMODINIT_FUNC init%s(void){" % self.hash_placeholder
             for block in self.init_blocks:
                 print >> stream, '  ', block
             print >> stream, '  ', ('(void) Py_InitModule("%s", MyMethods);'
-                                    % self.name)
+                                    % self.hash_placeholder)
         print >> stream, "}"
 
     def add_include(self, str):
+        assert not self.finalized
         self.includes.append(str)
 
     def add_init_code(self, code):
+        assert not self.finalized
         self.init_blocks.append(code)
 
     def add_support_code(self, code):
+        assert not self.finalized
         if code not in self.support_code:  # TODO: KLUDGE
             self.support_code.append(code)
 
     def add_function(self, fn):
+        assert not self.finalized
         self.functions.append(fn)
 
     def code(self):
@@ -205,7 +220,14 @@ static struct PyModuleDef moduledef = {{
         self.print_methoddef(sio)
         self.print_init(sio)
 
-        return sio.getvalue()
+        rval = sio.getvalue()
+        self.code_hash = hash_from_code(rval)
+        rval = re.sub(self.hash_placeholder, self.code_hash, rval)
+        # Finalize the Module, so no support code or function
+        # can be added
+        self.finalized = True
+
+        return rval
 
     def list_code(self, ofile=sys.stdout):
         """Print out the code with line numbers to `ofile` """
@@ -1450,34 +1472,6 @@ def gcc_version():
     return gcc_version_str
 
 
-def gcc_llvm():
-    """ Detect if the g++ version used is the llvm one or not.
-
-    It don't support all g++ parameters even if it support many of them.
-    """
-    if gcc_llvm.is_llvm is None:
-        pass
-        p = None
-        try:
-            p = call_subprocess_Popen(['g++', '--version'],
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE)
-            p.wait()
-            output = p.stdout.read() + p.stderr.read()
-        except OSError:
-            # Typically means g++ cannot be found.
-            # So it is not an llvm compiler.
-
-            # Normally this should not happen as we should not try to
-            # compile when g++ is not available. If this happen, it
-            # will crash later so supposing it is not llvm is "safe".
-            output = b('')
-        del p
-        gcc_llvm.is_llvm = b("llvm") in output
-    return gcc_llvm.is_llvm
-gcc_llvm.is_llvm = None
-
-
 class GCC_compiler(object):
     # The equivalent flags of --march=native used by g++.
     march_flags = None
@@ -1499,10 +1493,6 @@ class GCC_compiler(object):
         # http://en.gentoo-wiki.com/wiki/Safe_Cflags#-march.3Dnative
         # http://en.gentoo-wiki.com/wiki/Hardware_CFLAGS
         detect_march = GCC_compiler.march_flags is None
-        if detect_march and gcc_llvm():
-            detect_march = False
-            GCC_compiler.march_flags = []
-
         if detect_march:
             for f in cxxflags:
                 #If the user give an -march=X parameter, don't add one ourself
@@ -1524,6 +1514,9 @@ class GCC_compiler(object):
                                           stderr=subprocess.PIPE,
                                           shell=True)
                 p.wait()
+                if p.returncode != 0:
+                    return None
+
                 stdout = p.stdout.readlines()
                 stderr = p.stderr.readlines()
                 lines = []
@@ -1546,14 +1539,22 @@ class GCC_compiler(object):
             # The '-' at the end is needed. Otherwise, g++ do not output
             # enough information.
             native_lines = get_lines("g++ -march=native -E -v -")
-            _logger.info("g++ -march=native selected lines: %s", native_lines)
+            if native_lines is None:
+                _logger.info("Call to 'g++ -march=native' failed,"
+                             "not setting -march flag")
+                detect_march = False
+            else:
+                _logger.info("g++ -march=native selected lines: %s",
+                             native_lines)
+
+        if detect_march:
             if len(native_lines) != 1:
                 _logger.warn(
                     "OPTIMIZATION WARNING: Theano was not able to find the"
-                    " g++ parameter that tune the compilation to your specific"
-                    " CPU. This can slow down the execution of Theano"
-                    " function. Can you submit the following lines to"
-                    " Theano's mailing list such that we fix this"
+                    " g++ parameters that tune the compilation to your "
+                    " specific CPU. This can slow down the execution of Theano"
+                    " functions. Please submit the following lines to"
+                    " Theano's mailing list so that we can fix this"
                     " problem:\n %s", native_lines)
             else:
                 default_lines = get_lines("g++ -E -v -")
@@ -1561,11 +1562,11 @@ class GCC_compiler(object):
                 if len(default_lines) < 1:
                     _logger.warn(
                         "OPTIMIZATION WARNING: Theano was not able to find the"
-                        " default g++ parameter. This is needed to tune"
+                        " default g++ parameters. This is needed to tune"
                         " the compilation to your specific"
                         " CPU. This can slow down the execution of Theano"
-                        " function. Can you submit the following lines to"
-                        " Theano's mailing list such that we fix this"
+                        " functions. Please submit the following lines to"
+                        " Theano's mailing list so that we can fix this"
                         " problem:\n %s",
                         get_lines("g++ -E -v -", parse=False))
                 else:

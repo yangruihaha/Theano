@@ -3427,6 +3427,15 @@ class T_Scan(unittest.TestCase):
         assert numpy.allclose(outs[2], v_w + 3)
         assert numpy.allclose(sh.get_value(), v_w + 4)
 
+    def test_grad_bug_disconnected_input(self):
+        W = theano.shared(numpy.zeros((3, 3)), name='W')
+        v = theano.tensor.ivector(name='v')
+        y, _ = theano.scan(lambda i, W: W[i], sequences=v, outputs_info=None, non_sequences=W)
+
+        #This used to raise an exception
+        f = theano.function([v], theano.tensor.grad(y.sum(), W))
+        assert numpy.allclose(f([1,2]), [[0,0,0],[1,1,1],[1,1,1]])
+
     def test_clone(self):
         def test(x, y, mention_y):
             if mention_y:
@@ -3800,10 +3809,35 @@ def test_compute_test_value():
         x.tag.test_value = xv
         y = theano.shared(numpy.arange(3, dtype=theano.config.floatX),
                           name='y')
-        z, _ = theano.scan(
+        z, updates = theano.scan(
                 fn=lambda u, v: u + v,
                 sequences=[x, y])
-        assert not _
+        assert not updates
+        z.name = 'z'
+        # The gradient computation used to crash before 6af465e.
+        g = tensor.grad(z.sum(), x)
+        #f = theano.function([x], g)
+        #print f(xv)
+    finally:
+        theano.config.compute_test_value = backup
+
+
+def test_compute_test_value_nonseq():
+    # Verify that test values can be used for non_sequences with scan.
+    backup = theano.config.compute_test_value
+    theano.config.compute_test_value = 'raise'
+    try:
+        x = tensor.vector('x')
+        xv = numpy.ones(3, dtype=theano.config.floatX)
+        x.tag.test_value = xv
+        y = theano.shared(
+                numpy.arange(9, dtype=theano.config.floatX).reshape(3, 3),
+                name='y')
+        z, updates = theano.scan(
+                fn=lambda u, v: u + v,
+                sequences=[x],
+                non_sequences=[y])
+        assert not updates
         z.name = 'z'
         # The gradient computation used to crash before 6af465e.
         g = tensor.grad(z.sum(), x)
