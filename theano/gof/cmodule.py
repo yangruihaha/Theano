@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import itertools
 
 import distutils.sysconfig
 
@@ -1521,7 +1522,7 @@ class GCC_compiler(object):
                 stderr = decode_iter(p.stderr.readlines())
                 lines = []
                 if parse:
-                    for line in stdout + stderr:
+                    for line in itertools.chain(stdout, stderr):
                         if "COLLECT_GCC_OPTIONS=" in line:
                             continue
                         elif "-march=" in line and "-march=native" not in line:
@@ -1530,11 +1531,8 @@ class GCC_compiler(object):
                             lines.append(line.strip())
                     lines = list(set(lines))  # to remove duplicate
                 else:
-                    lines = stdout + stderr
-                if PY3:
-                    return [line.decode() for line in lines]
-                else:
-                    return lines
+                    lines = itertools.chain(stdout, stderr)
+                    return list(lines)
 
             # The '-' at the end is needed. Otherwise, g++ do not output
             # enough information.
