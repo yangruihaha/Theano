@@ -535,7 +535,10 @@ class test_Eigh(test_Eig):
 class test_Eigh_float32(test_Eigh):
     dtype = 'float32'
 
+
 def test_matrix_inverse_solve():
+    if not imported_scipy:
+        return
     A = theano.tensor.dmatrix('A')
     b = theano.tensor.dmatrix('b')
     node = matrix_inverse(A).dot(b).owner
